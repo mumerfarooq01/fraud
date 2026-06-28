@@ -10,6 +10,15 @@ import logging
 import time
 from typing import Dict, Optional
 
+from tax_validators.tax_field_schema import (
+    T1_EMPTY_FIELDS,
+    NOA_EMPTY_FIELDS,
+    T1_TEXT_EXTRACTION_INSTRUCTIONS,
+    NOA_TEXT_EXTRACTION_INSTRUCTIONS,
+    t1_json_schema,
+    noa_json_schema,
+)
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -47,43 +56,17 @@ def extract_structured_data_t1(text: str, model) -> dict:
     Returns:
         Structured dictionary with extracted data
     """
-    prompt = """
-    Extract the following information from this Canadian T1 Income Tax Return document:
-    
-    1. Social Insurance Number (SIN)
-    2. Full Name
-    3. Complete Address
-    4. Refund Amount or Balance Owing 
-    5. Total Income 
-    6. Net Income 
-    7. Taxable Income
-    8. Tax Deducted 
-    9. Tax Paid by Instalments 
-    10. Name of tax professional (if present)
-    11. Tax professional Phone Number (if present just extract the number not text associated with the number like "ext.")
-    12. Date of Filing (signature date)
-    
+    prompt = f"""
+    {T1_TEXT_EXTRACTION_INSTRUCTIONS}
+
     Return ONLY a JSON object with these EXACT field names:
-    {{
-      "sin": "value or null",
-      "full_name": "value or null",
-      "address": "value or null",
-      "refund_amount": "value or null",
-      "total_income": "value or null",
-      "net_income": "value or null",
-      "taxable_income": "value or null",
-      "tax_deducted": "value or null",
-      "tax_paid_instalments": "value or null",
-      "accountant_name": "value or null",
-      "accountant_phone": "value or null",
-      "filing_date": "value or null"
-    }}
-    
+    {t1_json_schema()}
+
     Use null for missing fields. Return ONLY the JSON, no other text.
-    
+
     Document text:
     {text}
-    """.format(text=text)
+    """
     
     try:
         logger.info("Extracting structured data from T1 document using Gemini")
@@ -99,22 +82,7 @@ def extract_structured_data_t1(text: str, model) -> dict:
         
     except Exception as e:
         logger.error(f"Error extracting T1 structured data: {str(e)}")
-        return {
-            "sin": None,
-            "full_name": None,
-            "address": None,
-            "refund_amount": None,
-            "total_income": None,
-            "net_income": None,
-            "taxable_income": None,
-            "tax_deducted": None,
-            "tax_paid_instalments": None,
-            "accountant_name": None,
-            "accountant_phone": None,
-            "filing_date": None
-        }
-
-def extract_structured_data_noa(text: str, model) -> dict:
+        return dict(T1_EMPTY_FIELDS)
     """
     Use Gemini to extract structured data from NOA document
     
@@ -125,39 +93,17 @@ def extract_structured_data_noa(text: str, model) -> dict:
     Returns:
         Structured dictionary with extracted data
     """
-    prompt = """
-    Extract the following information from this Canadian Notice of Assessment document:
-    
-    1. Social Insurance Number (last 4 digits visible, format: XXX XX3 XXX)
-    2. Full Name
-    3. Complete Address
-    4. Refund Amount (shown in account summary)
-    5. Total Income
-    6. Net Income
-    7. Taxable Income
-    8. Total Income Tax Deducted
-    9. Tax Paid by Instalments
-    10. Date Issued (assessment date)
-    
+    prompt = f"""
+    {NOA_TEXT_EXTRACTION_INSTRUCTIONS}
+
     Return ONLY a JSON object with these EXACT field names:
-    {{
-      "sin": "value or null",
-      "full_name": "value or null",
-      "address": "value or null",
-      "refund_amount": "value or null",
-      "total_income": "value or null",
-      "net_income": "value or null",
-      "taxable_income": "value or null",
-      "tax_deducted": "value or null",
-      "tax_paid_instalments": "value or null",
-      "date_issued": "value or null"
-    }}
-    
+    {noa_json_schema()}
+
     Use null for missing fields. Return ONLY the JSON, no other text.
-    
+
     Document text:
     {text}
-    """.format(text=text)
+    """
     
     try:
         logger.info("Extracting structured data from NOA document using Gemini")
@@ -173,18 +119,202 @@ def extract_structured_data_noa(text: str, model) -> dict:
         
     except Exception as e:
         logger.error(f"Error extracting NOA structured data: {str(e)}")
-        return {
-            "sin": None,
-            "full_name": None,
-            "address": None,
-            "refund_amount": None,
-            "total_income": None,
-            "net_income": None,
-            "taxable_income": None,
-            "tax_deducted": None,
-            "tax_paid_instalments": None,
-            "date_issued": None
-        }
+        return dict(NOA_EMPTY_FIELDS)
+
+MIN_POPULATED_FIELDS = 3
+MAX_VISION_PAGES = 5
+
+
+def extract_structured_data_t1_smart(
+    text: str, pdf_path: str, pdf_bytes: bytes, model
+) -> dict:
+    """
+    Extract T1 fields from text, then fall back to Gemini Vision on the PDF if sparse.
+    """
+    data = (
+        extract_structured_data_t1(text, model)
+        if text and text.strip()
+        else dict(T1_EMPTY_FIELDS)
+    )
+
+    if not _is_sparse_extraction(data):
+        return data
+
+    logger.info("T1 structured extraction sparse — falling back to Gemini Vision")
+    vision_data = _extract_structured_data_from_pdf_vision(
+        pdf_path, pdf_bytes, "t1", model
+    )
+    return _merge_extraction_results(data, vision_data, T1_EMPTY_FIELDS)
+
+
+def extract_structured_data_noa_smart(
+    text: str, pdf_path: str, pdf_bytes: bytes, model
+) -> dict:
+    """
+    Extract NOA fields from text, then fall back to Gemini Vision on the PDF if sparse.
+    """
+    data = (
+        extract_structured_data_noa(text, model)
+        if text and text.strip()
+        else dict(NOA_EMPTY_FIELDS)
+    )
+
+    if not _is_sparse_extraction(data):
+        return data
+
+    logger.info("NOA structured extraction sparse — falling back to Gemini Vision")
+    vision_data = _extract_structured_data_from_pdf_vision(
+        pdf_path, pdf_bytes, "noa", model
+    )
+    return _merge_extraction_results(data, vision_data, NOA_EMPTY_FIELDS)
+
+
+def _is_sparse_extraction(data: dict) -> bool:
+    """True when too few fields were extracted to be useful."""
+    if not data:
+        return True
+    populated = sum(
+        1
+        for value in data.values()
+        if value is not None and str(value).strip().lower() not in ("", "null", "none", "n/a")
+    )
+    return populated < MIN_POPULATED_FIELDS
+
+
+def _merge_extraction_results(primary: dict, fallback: dict, template: dict) -> dict:
+    """Prefer primary values, fill gaps from fallback/vision."""
+    merged = dict(template)
+    for key in template:
+        primary_val = primary.get(key) if primary else None
+        fallback_val = fallback.get(key) if fallback else None
+        if _has_value(primary_val):
+            merged[key] = primary_val
+        elif _has_value(fallback_val):
+            merged[key] = fallback_val
+        else:
+            merged[key] = None
+    return merged
+
+
+def _has_value(value) -> bool:
+    return value is not None and str(value).strip().lower() not in ("", "null", "none", "n/a")
+
+
+def _vision_prompt_t1() -> str:
+    return f"""
+    You are reading a Canadian T1 Income Tax Return PDF document (image or file).
+    {T1_TEXT_EXTRACTION_INSTRUCTIONS}
+    Return ONLY a JSON object with these EXACT keys:
+    {t1_json_schema()}
+    Use null for missing fields. Return ONLY valid JSON, no markdown.
+    """
+
+
+def _vision_prompt_noa() -> str:
+    return f"""
+    You are reading a Canadian Notice of Assessment (NOA) PDF document (image or file).
+    {NOA_TEXT_EXTRACTION_INSTRUCTIONS}
+    Return ONLY a JSON object with these EXACT keys:
+    {noa_json_schema()}
+    Use null for missing fields. Return ONLY valid JSON, no markdown.
+    """
+
+
+def _extract_structured_data_from_pdf_vision(
+    pdf_path: str, pdf_bytes: bytes, doc_type: str, model
+) -> dict:
+    """Use Gemini multimodal input (PDF upload, then page images) to extract fields."""
+    empty = T1_EMPTY_FIELDS if doc_type == "t1" else NOA_EMPTY_FIELDS
+    prompt = _vision_prompt_t1() if doc_type == "t1" else _vision_prompt_noa()
+
+    # 1) Try native PDF upload
+    try:
+        uploaded = genai.upload_file(pdf_path, mime_type="application/pdf")
+        uploaded = _wait_for_file_active(uploaded)
+        response_text = _send_gemini_content_request(model, [prompt, uploaded])
+        _safe_delete_uploaded_file(uploaded)
+        parsed = _parse_json_response(response_text)
+        if not _is_sparse_extraction(parsed):
+            logger.info("Gemini Vision PDF upload succeeded for %s", doc_type)
+            return parsed
+        logger.warning("Gemini Vision PDF upload returned sparse data for %s", doc_type)
+    except Exception as exc:
+        logger.warning("Gemini Vision PDF upload failed for %s: %s", doc_type, exc)
+
+    # 2) Fallback: send rendered page images
+    try:
+        from pdf2image import convert_from_bytes
+        import io
+
+        images = convert_from_bytes(pdf_bytes, dpi=200)
+        parts = [prompt]
+        for image in images[:MAX_VISION_PAGES]:
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            parts.append({"mime_type": "image/png", "data": buffer.getvalue()})
+
+        response_text = _send_gemini_content_request(model, parts)
+        parsed = _parse_json_response(response_text)
+        logger.info(
+            "Gemini Vision image fallback extracted %s fields for %s",
+            sum(1 for v in parsed.values() if _has_value(v)),
+            doc_type,
+        )
+        return parsed if parsed else dict(empty)
+    except Exception as exc:
+        logger.error("Gemini Vision image fallback failed for %s: %s", doc_type, exc)
+        return dict(empty)
+
+
+def _wait_for_file_active(uploaded, timeout_seconds: int = 90):
+    """Wait until an uploaded Gemini file is ready."""
+    deadline = time.time() + timeout_seconds
+    current = uploaded
+    while current.state.name == "PROCESSING":
+        if time.time() > deadline:
+            raise TimeoutError("Gemini file processing timed out")
+        time.sleep(2)
+        current = genai.get_file(current.name)
+    if current.state.name != "ACTIVE":
+        raise ValueError(f"Uploaded file not active: {current.state.name}")
+    return current
+
+
+def _safe_delete_uploaded_file(uploaded) -> None:
+    try:
+        if uploaded and getattr(uploaded, "name", None):
+            genai.delete_file(uploaded.name)
+    except Exception as exc:
+        logger.debug("Could not delete uploaded Gemini file: %s", exc)
+
+
+def _send_gemini_content_request(model, parts, max_retries: int = 3) -> str:
+    """Send multimodal content (text, files, images) to Gemini."""
+    for attempt in range(max_retries):
+        try:
+            logger.info(
+                "Sending multimodal request to Gemini (attempt %s/%s)",
+                attempt + 1,
+                max_retries,
+            )
+            response = model.generate_content(
+                parts,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0,
+                    max_output_tokens=4096,
+                ),
+            )
+            if response and response.text:
+                return response.text
+            logger.warning("Empty multimodal response from Gemini on attempt %s", attempt + 1)
+        except Exception as exc:
+            logger.error("Gemini multimodal error on attempt %s: %s", attempt + 1, exc)
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+            else:
+                raise
+    raise Exception("Gemini multimodal request failed after all retry attempts")
+
 
 def validate_cross_document(t1_data: dict, noa_data: dict, model) -> dict:
     """
@@ -207,12 +337,16 @@ def validate_cross_document(t1_data: dict, noa_data: dict, model) -> dict:
     Check for:
     1. SIN matching (last 4 digits)
     2. Name matching (exact or minor variations)
-    3. Address matching (exact or minor variations)
-    4. Refund amount matching
-    5. Income figures matching (total, net, taxable)
-    6. Tax deducted matching
-    7. Date logic (filing date before assessment date)
-    8. Installment payments >= $10,000 (flag for review)
+    3. Address and province matching
+    4. Tax year matching between T1 and NOA
+    5. Refund amount OR balance owing consistency (T1 refund vs NOA refund/balance)
+    6. Income figures matching (total, employment, self-employment, net, taxable)
+    7. Tax deducted, instalments, net federal tax, and provincial tax matching
+    8. CPP, EI, RRSP figures on T1 vs NOA limits/credits where comparable
+    9. Date logic (filing date before assessment date)
+    10. NOA identification number present on NOA
+    11. Installment payments >= $10,000 (flag for review)
+    12. Assessment result (refund/balance/nil) consistent with dollar amounts
     
     Return JSON with:
     {{
@@ -220,12 +354,18 @@ def validate_cross_document(t1_data: dict, noa_data: dict, model) -> dict:
         {{"check": "SIN Match", "status": "pass/fail/warning", "confidence": 0-100, "details": "explanation"}},
         {{"check": "Name Match", "status": "pass/fail/warning", "confidence": 0-100, "details": "explanation"}},
         {{"check": "Address Match", "status": "pass/fail/warning", "confidence": 0-100, "details": "explanation"}},
-        {{"check": "Refund Amount Match", "status": "pass/fail/warning", "confidence": 0-100, "details": "explanation"}},
+        {{"check": "Province Match", "status": "pass/fail/warning", "confidence": 0-100, "details": "explanation"}},
+        {{"check": "Tax Year Match", "status": "pass/fail/warning", "confidence": 0-100, "details": "explanation"}},
+        {{"check": "Refund/Balance Match", "status": "pass/fail/warning", "confidence": 0-100, "details": "explanation"}},
         {{"check": "Total Income Match", "status": "pass/fail/warning", "confidence": 0-100, "details": "explanation"}},
+        {{"check": "Employment Income Match", "status": "pass/fail/warning", "confidence": 0-100, "details": "explanation"}},
         {{"check": "Net Income Match", "status": "pass/fail/warning", "confidence": 0-100, "details": "explanation"}},
         {{"check": "Taxable Income Match", "status": "pass/fail/warning", "confidence": 0-100, "details": "explanation"}},
         {{"check": "Tax Deducted Match", "status": "pass/fail/warning", "confidence": 0-100, "details": "explanation"}},
+        {{"check": "Net Federal Tax Match", "status": "pass/fail/warning", "confidence": 0-100, "details": "explanation"}},
+        {{"check": "Provincial Tax Match", "status": "pass/fail/warning", "confidence": 0-100, "details": "explanation"}},
         {{"check": "Date Logic", "status": "pass/fail/warning", "confidence": 0-100, "details": "explanation"}},
+        {{"check": "NOA ID Present", "status": "pass/fail/warning", "confidence": 0-100, "details": "explanation"}},
         {{"check": "High Installment Payment", "status": "pass/fail/warning", "confidence": 0-100, "details": "explanation"}}
       ],
       "overall_risk": "low/medium/high",
@@ -326,7 +466,7 @@ def _send_gemini_request(model, prompt: str, max_retries: int = 3) -> str:
                 prompt,
                 generation_config=genai.types.GenerationConfig(
                     temperature=0,  # Consistent extraction
-                    max_output_tokens=2048,
+                    max_output_tokens=4096,
                 )
             )
             

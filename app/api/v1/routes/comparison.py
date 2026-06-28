@@ -1,17 +1,20 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from app.api.v1.schemas.comparison import ComparisonResponse
 from app.config import settings
+import logging
 import time
 import tempfile
 import os
 
+logger = logging.getLogger(__name__)
+
 # Import existing validators
 try:
-    from tax_validators.data_extractor import extract_text_from_pdf
+    from tax_validators.document_text import extract_document_text
     from tax_validators.gemini_validator import (
         initialize_gemini,
-        extract_structured_data_t1,
-        extract_structured_data_noa,
+        extract_structured_data_t1_smart,
+        extract_structured_data_noa_smart,
         validate_cross_document
     )
 except ImportError as e:
@@ -83,13 +86,18 @@ async def validate_documents(
         # Initialize Gemini
         model = initialize_gemini()
         
-        # Extract text from both documents
-        t1_text = extract_text_from_pdf(t1_path)
-        noa_text = extract_text_from_pdf(noa_path)
+        # Extract text (pdfplumber → OCR fallback)
+        t1_text, t1_text_method = extract_document_text(t1_path, t1_content)
+        noa_text, noa_text_method = extract_document_text(noa_path, noa_content)
+        logger.info("T1 text method: %s, NOA text method: %s", t1_text_method, noa_text_method)
         
-        # Extract structured data
-        t1_data = extract_structured_data_t1(t1_text, model)
-        noa_data = extract_structured_data_noa(noa_text, model)
+        # Extract structured data (text → Gemini Vision fallback if sparse)
+        t1_data = extract_structured_data_t1_smart(
+            t1_text, t1_path, t1_content, model
+        )
+        noa_data = extract_structured_data_noa_smart(
+            noa_text, noa_path, noa_content, model
+        )
         
         # Perform cross-document validation
         validation_results = validate_cross_document(t1_data, noa_data, model)
