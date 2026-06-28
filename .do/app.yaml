@@ -1,0 +1,61 @@
+# DigitalOcean App Platform spec
+# 1. Update github.repo to your repository
+# 2. Set GEMINI_API_KEY in the DO dashboard (Secrets)
+# 3. Deploy: doctl apps create --spec .do/app.yaml
+#    or connect the repo in https://cloud.digitalocean.com/apps
+
+name: fraud-detection-api
+region: tor1
+
+services:
+  - name: api
+    github:
+      repo: your-username/fraud-detection-api
+      branch: main
+      deploy_on_push: true
+
+    # Uses Dockerfile (includes tesseract + poppler)
+    dockerfile_path: Dockerfile
+
+    instance_count: 1
+    instance_size_slug: basic-xs
+
+    http_port: 8000
+
+    health_check:
+      http_path: /health
+      initial_delay_seconds: 60
+      period_seconds: 10
+      timeout_seconds: 10
+      success_threshold: 1
+      failure_threshold: 3
+
+    envs:
+      - key: API_HOST
+        value: "0.0.0.0"
+        scope: RUN_TIME
+      - key: API_PORT
+        value: "8000"
+        scope: RUN_TIME
+      - key: API_RELOAD
+        value: "false"
+        scope: RUN_TIME
+      - key: CORS_ORIGINS
+        value: "http://app.thelendguard.ca,http://server.thelendguard.ca,https://app.thelendguard.ca,https://server.thelendguard.ca"
+        scope: RUN_TIME
+      - key: GEMINI_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+      - key: SECRET_KEY
+        scope: RUN_TIME
+        type: SECRET
+        generate: true
+      - key: MAX_FILE_SIZE_MB
+        value: "500"
+        scope: RUN_TIME
+      - key: DATABASE_URL
+        value: "sqlite:///./data/forensic_records.db"
+        scope: RUN_TIME
+      - key: FORENSIC_DB_PATH
+        value: "./data/forensic_records.db"
+        scope: RUN_TIME

@@ -1,0 +1,61 @@
+# Alternative: Python buildpack deploy (no Docker)
+# Use if Docker build fails: doctl apps create --spec .do/app.python.yaml
+# Requires runtime.txt (python-3.12.7)
+
+name: fraud-detection-api
+region: tor1
+
+services:
+  - name: api
+    github:
+      repo: your-username/fraud-detection-api
+      branch: main
+      deploy_on_push: true
+
+    environment_slug: python
+
+    build_command: |
+      pip install --upgrade pip setuptools wheel
+      pip install -r requirements.txt
+
+    run_command: gunicorn app.main:app --workers 2 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 120 --access-logfile - --error-logfile -
+
+    instance_count: 1
+    instance_size_slug: basic-xs
+
+    http_port: 8080
+
+    health_check:
+      http_path: /health
+      initial_delay_seconds: 60
+      period_seconds: 10
+      timeout_seconds: 10
+      success_threshold: 1
+      failure_threshold: 3
+
+    envs:
+      - key: API_HOST
+        value: "0.0.0.0"
+        scope: RUN_TIME
+      - key: API_RELOAD
+        value: "false"
+        scope: RUN_TIME
+      - key: CORS_ORIGINS
+        value: "http://app.thelendguard.ca,http://server.thelendguard.ca,https://app.thelendguard.ca,https://server.thelendguard.ca"
+        scope: RUN_TIME
+      - key: GEMINI_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+      - key: SECRET_KEY
+        scope: RUN_TIME
+        type: SECRET
+        generate: true
+      - key: MAX_FILE_SIZE_MB
+        value: "500"
+        scope: RUN_TIME
+      - key: DATABASE_URL
+        value: "sqlite:///./data/forensic_records.db"
+        scope: RUN_TIME
+      - key: FORENSIC_DB_PATH
+        value: "./data/forensic_records.db"
+        scope: RUN_TIME
