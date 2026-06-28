@@ -41,7 +41,7 @@ services:
         value: "false"
         scope: RUN_TIME
       - key: CORS_ORIGINS
-        value: "http://app.thelendguard.ca,http://server.thelendguard.ca,https://app.thelendguard.ca,https://server.thelendguard.ca"
+        value: "http://app.thelendguard.ca,https://app.thelendguard.ca,http://server.thelendguard.ca,https://server.thelendguard.ca,http://localhost:4200"
         scope: RUN_TIME
       - key: GEMINI_API_KEY
         scope: RUN_TIME

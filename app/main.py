@@ -101,6 +101,7 @@ async def health_check():
 async def startup_event():
     """Run on application startup"""
     print(f"Starting {settings.PROJECT_NAME} v{settings.VERSION}")
+    print(f"CORS allowed origins: {settings.cors_origins_list}")
     # Display localhost for browser access (0.0.0.0 is just the bind address)
     display_host = "localhost" if settings.API_HOST == "0.0.0.0" else settings.API_HOST
     print(f"API Documentation: http://{display_host}:{settings.API_PORT}/api/docs")
