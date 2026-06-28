@@ -83,6 +83,9 @@ def extract_structured_data_t1(text: str, model) -> dict:
     except Exception as e:
         logger.error(f"Error extracting T1 structured data: {str(e)}")
         return dict(T1_EMPTY_FIELDS)
+
+
+def extract_structured_data_noa(text: str, model) -> dict:
     """
     Use Gemini to extract structured data from NOA document
     
