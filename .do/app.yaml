@@ -46,6 +46,9 @@ services:
       - key: GEMINI_API_KEY
         scope: RUN_TIME
         type: SECRET
+      - key: GEMINI_MODEL
+        value: "gemini-2.5-flash"
+        scope: RUN_TIME
       - key: SECRET_KEY
         scope: RUN_TIME
         type: SECRET

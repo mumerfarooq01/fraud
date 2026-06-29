@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     
     # Gemini API
     GEMINI_API_KEY: Optional[str] = None
+    GEMINI_MODEL: str = "gemini-2.5-flash"
     
     # Security
     SECRET_KEY: str = "change-this-in-production"
