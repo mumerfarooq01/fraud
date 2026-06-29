@@ -338,11 +338,12 @@ def _extract_t1_fields(pdf_text: str) -> dict:
             fields['filing_date'] = filing_match.group(1)
             break
     
-    # Extract tax year
-    year_pattern = r'(?:20\d{2}|19\d{2})'
-    year_match = re.search(year_pattern, pdf_text)
-    if year_match:
-        fields['tax_year'] = year_match.group()
+    # Extract tax year (labeled patterns first — see tax_year_extractor)
+    from tax_validators.tax_year_extractor import extract_tax_year_from_text
+
+    tax_year = extract_tax_year_from_text(pdf_text, "T1")
+    if tax_year:
+        fields["tax_year"] = tax_year
     
     # Extract accountant info
     accountant_patterns = [
@@ -510,10 +511,11 @@ def _extract_noa_fields(pdf_text: str) -> dict:
             fields['assessment_date'] = assessment_match.group(1)
             break
     
-    # Extract tax year
-    year_pattern = r'(?:20\d{2}|19\d{2})'
-    year_match = re.search(year_pattern, pdf_text)
-    if year_match:
-        fields['tax_year'] = year_match.group()
-    
+    # Extract tax year (labeled patterns first — see tax_year_extractor)
+    from tax_validators.tax_year_extractor import extract_tax_year_from_text
+
+    tax_year = extract_tax_year_from_text(pdf_text, "NOA")
+    if tax_year:
+        fields["tax_year"] = tax_year
+
     return fields

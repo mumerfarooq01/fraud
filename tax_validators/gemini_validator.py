@@ -8,7 +8,8 @@ import os
 import json
 import logging
 import time
-from typing import Dict, Optional
+import re
+from typing import Dict, Optional, List
 
 from tax_validators.tax_field_schema import (
     T1_EMPTY_FIELDS,
@@ -17,6 +18,12 @@ from tax_validators.tax_field_schema import (
     NOA_TEXT_EXTRACTION_INSTRUCTIONS,
     t1_json_schema,
     noa_json_schema,
+)
+from tax_validators.data_extractor import extract_key_fields
+from tax_validators.document_text import MIN_TEXT_LENGTH
+from tax_validators.tax_year_extractor import (
+    extract_tax_year_from_text,
+    extract_tax_year_from_pdf_bytes,
 )
 
 # Configure logging
@@ -75,9 +82,14 @@ def extract_structured_data_t1(text: str, model) -> dict:
         response = _send_gemini_request(model, prompt, max_retries=3)
         
         # Parse JSON response
-        structured_data = _parse_json_response(response)
+        structured_data = _normalize_extraction(
+            _parse_json_response(response), T1_EMPTY_FIELDS
+        )
         
-        logger.info(f"Successfully extracted {len([k for k, v in structured_data.items() if v is not None])} fields from T1")
+        logger.info(
+            "Successfully extracted %s populated fields from T1",
+            _count_populated(structured_data),
+        )
         return structured_data
         
     except Exception as e:
@@ -115,9 +127,14 @@ def extract_structured_data_noa(text: str, model) -> dict:
         response = _send_gemini_request(model, prompt, max_retries=3)
         
         # Parse JSON response
-        structured_data = _parse_json_response(response)
+        structured_data = _normalize_extraction(
+            _parse_json_response(response), NOA_EMPTY_FIELDS
+        )
         
-        logger.info(f"Successfully extracted {len([k for k, v in structured_data.items() if v is not None])} fields from NOA")
+        logger.info(
+            "Successfully extracted %s populated fields from NOA",
+            _count_populated(structured_data),
+        )
         return structured_data
         
     except Exception as e:
@@ -129,47 +146,227 @@ MAX_VISION_PAGES = 5
 
 
 def extract_structured_data_t1_smart(
-    text: str, pdf_path: str, pdf_bytes: bytes, model
+    text: str,
+    pdf_path: str,
+    pdf_bytes: bytes,
+    model,
+    text_method: str = "unknown",
 ) -> dict:
     """
-    Extract T1 fields from text, then fall back to Gemini Vision on the PDF if sparse.
+    Extract T1 fields using regex bootstrap, Gemini text, and Gemini Vision.
     """
-    data = (
-        extract_structured_data_t1(text, model)
-        if text and text.strip()
-        else dict(T1_EMPTY_FIELDS)
+    return _extract_structured_data_smart(
+        text=text,
+        pdf_path=pdf_path,
+        pdf_bytes=pdf_bytes,
+        model=model,
+        doc_type="t1",
+        text_method=text_method,
+        empty_template=T1_EMPTY_FIELDS,
+        text_extractor=extract_structured_data_t1,
     )
-
-    if not _is_sparse_extraction(data):
-        return data
-
-    logger.info("T1 structured extraction sparse — falling back to Gemini Vision")
-    vision_data = _extract_structured_data_from_pdf_vision(
-        pdf_path, pdf_bytes, "t1", model
-    )
-    return _merge_extraction_results(data, vision_data, T1_EMPTY_FIELDS)
 
 
 def extract_structured_data_noa_smart(
-    text: str, pdf_path: str, pdf_bytes: bytes, model
+    text: str,
+    pdf_path: str,
+    pdf_bytes: bytes,
+    model,
+    text_method: str = "unknown",
 ) -> dict:
     """
-    Extract NOA fields from text, then fall back to Gemini Vision on the PDF if sparse.
+    Extract NOA fields using regex bootstrap, Gemini text, and Gemini Vision.
     """
-    data = (
-        extract_structured_data_noa(text, model)
-        if text and text.strip()
-        else dict(NOA_EMPTY_FIELDS)
+    return _extract_structured_data_smart(
+        text=text,
+        pdf_path=pdf_path,
+        pdf_bytes=pdf_bytes,
+        model=model,
+        doc_type="noa",
+        text_method=text_method,
+        empty_template=NOA_EMPTY_FIELDS,
+        text_extractor=extract_structured_data_noa,
     )
 
-    if not _is_sparse_extraction(data):
+
+def _extract_structured_data_smart(
+    text: str,
+    pdf_path: str,
+    pdf_bytes: bytes,
+    model,
+    doc_type: str,
+    text_method: str,
+    empty_template: dict,
+    text_extractor,
+) -> dict:
+    merged = dict(empty_template)
+
+    # 1) Regex bootstrap from any available text (fast, no API cost)
+    if text and text.strip():
+        regex_data = _regex_bootstrap_fields(text, doc_type)
+        merged = _merge_extraction_results(merged, regex_data, empty_template)
+        logger.info(
+            "%s regex bootstrap populated %s fields (text_method=%s)",
+            doc_type.upper(),
+            _count_populated(regex_data),
+            text_method,
+        )
+
+    use_vision_first = (
+        text_method in ("none", "partial", "ocr_partial")
+        or not text
+        or len(text.strip()) < MIN_TEXT_LENGTH
+    )
+
+    # 2) Vision first for scanned/image PDFs
+    if use_vision_first:
+        logger.info("%s using Gemini Vision first (text_method=%s)", doc_type.upper(), text_method)
+        vision_data = _extract_structured_data_from_pdf_vision(
+            pdf_path, pdf_bytes, doc_type, model
+        )
+        merged = _merge_extraction_results(merged, vision_data, empty_template)
+
+    # 3) Gemini text extraction when enough text is available
+    if text and len(text.strip()) >= MIN_TEXT_LENGTH and _is_sparse_extraction(merged):
+        text_data = text_extractor(text, model)
+        merged = _merge_extraction_results(merged, text_data, empty_template)
+
+    # 4) Vision fallback if still sparse
+    if _is_sparse_extraction(merged):
+        logger.info("%s structured extraction still sparse — trying Gemini Vision", doc_type.upper())
+        vision_data = _extract_structured_data_from_pdf_vision(
+            pdf_path, pdf_bytes, doc_type, model
+        )
+        merged = _merge_extraction_results(merged, vision_data, empty_template)
+
+    # 5) Always try dedicated tax year extraction (header OCR + focused vision)
+    merged = _enrich_tax_year(merged, text, pdf_bytes, doc_type, model, empty_template)
+
+    logger.info(
+        "%s final extraction populated %s/%s fields",
+        doc_type.upper(),
+        _count_populated(merged),
+        len(empty_template),
+    )
+    return merged
+
+
+def _regex_bootstrap_fields(text: str, doc_type: str) -> dict:
+    """Map regex-based field extraction onto the shared schema."""
+    raw = extract_key_fields(text, "T1" if doc_type == "t1" else "NOA")
+    mapped = {}
+
+    if raw.get("sin"):
+        mapped["sin"] = raw["sin"]
+    if raw.get("name"):
+        mapped["full_name"] = raw["name"]
+    if raw.get("address"):
+        mapped["address"] = raw["address"]
+    if raw.get("tax_year"):
+        mapped["tax_year"] = raw["tax_year"]
+    if raw.get("refund_amount"):
+        mapped["refund_amount"] = raw["refund_amount"]
+    if raw.get("total_income"):
+        mapped["total_income"] = raw["total_income"]
+    if raw.get("net_income"):
+        mapped["net_income"] = raw["net_income"]
+    if raw.get("taxable_income"):
+        mapped["taxable_income"] = raw["taxable_income"]
+    if raw.get("balance_owing"):
+        mapped["balance_owing"] = raw["balance_owing"]
+    if raw.get("provincial_tax"):
+        mapped["provincial_tax"] = raw["provincial_tax"]
+    if raw.get("federal_tax"):
+        mapped["net_federal_tax"] = raw["federal_tax"]
+    if raw.get("accountant_info"):
+        mapped["accountant_name"] = raw["accountant_info"]
+
+    if doc_type == "t1" and raw.get("filing_date"):
+        mapped["filing_date"] = raw["filing_date"]
+    if doc_type == "noa" and raw.get("assessment_date"):
+        mapped["date_issued"] = raw["assessment_date"]
+
+    # Dedicated tax year patterns (CRA header labels)
+    tax_year = extract_tax_year_from_text(text, doc_type.upper())
+    if tax_year:
+        mapped["tax_year"] = tax_year
+
+    return mapped
+
+
+def _enrich_tax_year(
+    data: dict,
+    text: str,
+    pdf_bytes: bytes,
+    doc_type: str,
+    model,
+    template: dict,
+) -> dict:
+    """Fill tax_year using text patterns, page-1 OCR, then focused Gemini vision."""
+    if _has_value(data.get("tax_year")):
         return data
 
-    logger.info("NOA structured extraction sparse — falling back to Gemini Vision")
-    vision_data = _extract_structured_data_from_pdf_vision(
-        pdf_path, pdf_bytes, "noa", model
-    )
-    return _merge_extraction_results(data, vision_data, NOA_EMPTY_FIELDS)
+    year = None
+    if text and text.strip():
+        year = extract_tax_year_from_text(text, doc_type.upper())
+
+    if not year and pdf_bytes:
+        year = extract_tax_year_from_pdf_bytes(pdf_bytes, doc_type.upper())
+
+    if not year and pdf_bytes and model:
+        year = _extract_tax_year_gemini_vision(pdf_bytes, doc_type, model)
+
+    if year:
+        enriched = dict(data)
+        enriched["tax_year"] = year
+        logger.info("Enriched %s tax_year=%s", doc_type.upper(), year)
+        return _normalize_extraction(enriched, template)
+
+    return data
+
+
+def _extract_tax_year_gemini_vision(
+    pdf_bytes: bytes, doc_type: str, model
+) -> Optional[str]:
+    """Focused single-field Gemini vision call for the taxation year on page 1."""
+    prompt = """
+    Look at this Canadian tax document (T1 or NOA).
+    What is the TAXATION YEAR on the form — the large year in the header (e.g. "2023")?
+    This is NOT the filing date or date issued.
+
+    Return ONLY JSON: {"tax_year": "2023"} or {"tax_year": null}
+    """
+    try:
+        from pdf2image import convert_from_bytes
+        from tax_validators.tax_year_extractor import _valid_tax_year
+
+        images = convert_from_bytes(pdf_bytes, dpi=200, first_page=1, last_page=1)
+        if not images:
+            return None
+
+        response_text = _send_gemini_content_request(model, [prompt, images[0]])
+        parsed = _parse_json_response(response_text)
+        year = parsed.get("tax_year") if parsed else None
+        if _has_value(year):
+            return _valid_tax_year(str(year).strip())
+    except Exception as exc:
+        logger.warning("Focused Gemini tax year extraction failed for %s: %s", doc_type, exc)
+    return None
+
+
+def _count_populated(data: dict) -> int:
+    return sum(1 for value in data.values() if _has_value(value))
+
+
+def _normalize_extraction(data: dict, template: dict) -> dict:
+    """Ensure all template keys exist and clean placeholder values."""
+    normalized = dict(template)
+    if not data:
+        return normalized
+    for key in template:
+        value = data.get(key)
+        normalized[key] = value if _has_value(value) else None
+    return normalized
 
 
 def _is_sparse_extraction(data: dict) -> bool:
@@ -226,46 +423,48 @@ def _vision_prompt_noa() -> str:
 def _extract_structured_data_from_pdf_vision(
     pdf_path: str, pdf_bytes: bytes, doc_type: str, model
 ) -> dict:
-    """Use Gemini multimodal input (PDF upload, then page images) to extract fields."""
+    """Use Gemini multimodal input (page images, then PDF upload) to extract fields."""
     empty = T1_EMPTY_FIELDS if doc_type == "t1" else NOA_EMPTY_FIELDS
     prompt = _vision_prompt_t1() if doc_type == "t1" else _vision_prompt_noa()
 
-    # 1) Try native PDF upload
+    # 1) Render pages to PIL images — most reliable on App Platform
+    try:
+        from pdf2image import convert_from_bytes
+
+        images = convert_from_bytes(pdf_bytes, dpi=200)
+        if images:
+            parts: List = [prompt]
+            parts.extend(images[:MAX_VISION_PAGES])
+            response_text = _send_gemini_content_request(model, parts)
+            parsed = _normalize_extraction(_parse_json_response(response_text), empty)
+            if not _is_sparse_extraction(parsed):
+                logger.info("Gemini Vision image extraction succeeded for %s", doc_type)
+                return parsed
+            logger.warning(
+                "Gemini Vision image extraction sparse for %s (%s fields)",
+                doc_type,
+                _count_populated(parsed),
+            )
+        else:
+            logger.warning("pdf2image returned no pages for %s", doc_type)
+    except Exception as exc:
+        logger.warning("Gemini Vision image extraction failed for %s: %s", doc_type, exc)
+
+    # 2) Fallback: native PDF upload
     try:
         uploaded = genai.upload_file(pdf_path, mime_type="application/pdf")
         uploaded = _wait_for_file_active(uploaded)
         response_text = _send_gemini_content_request(model, [prompt, uploaded])
         _safe_delete_uploaded_file(uploaded)
-        parsed = _parse_json_response(response_text)
-        if not _is_sparse_extraction(parsed):
-            logger.info("Gemini Vision PDF upload succeeded for %s", doc_type)
-            return parsed
-        logger.warning("Gemini Vision PDF upload returned sparse data for %s", doc_type)
-    except Exception as exc:
-        logger.warning("Gemini Vision PDF upload failed for %s: %s", doc_type, exc)
-
-    # 2) Fallback: send rendered page images
-    try:
-        from pdf2image import convert_from_bytes
-        import io
-
-        images = convert_from_bytes(pdf_bytes, dpi=200)
-        parts = [prompt]
-        for image in images[:MAX_VISION_PAGES]:
-            buffer = io.BytesIO()
-            image.save(buffer, format="PNG")
-            parts.append({"mime_type": "image/png", "data": buffer.getvalue()})
-
-        response_text = _send_gemini_content_request(model, parts)
-        parsed = _parse_json_response(response_text)
+        parsed = _normalize_extraction(_parse_json_response(response_text), empty)
         logger.info(
-            "Gemini Vision image fallback extracted %s fields for %s",
-            sum(1 for v in parsed.values() if _has_value(v)),
+            "Gemini Vision PDF upload extracted %s fields for %s",
+            _count_populated(parsed),
             doc_type,
         )
-        return parsed if parsed else dict(empty)
+        return parsed
     except Exception as exc:
-        logger.error("Gemini Vision image fallback failed for %s: %s", doc_type, exc)
+        logger.warning("Gemini Vision PDF upload failed for %s: %s", doc_type, exc)
         return dict(empty)
 
 
@@ -304,11 +503,13 @@ def _send_gemini_content_request(model, parts, max_retries: int = 3) -> str:
                 parts,
                 generation_config=genai.types.GenerationConfig(
                     temperature=0,
-                    max_output_tokens=4096,
+                    max_output_tokens=8192,
+                    response_mime_type="application/json",
                 ),
             )
-            if response and response.text:
-                return response.text
+            response_text = _get_response_text(response)
+            if response_text:
+                return response_text
             logger.warning("Empty multimodal response from Gemini on attempt %s", attempt + 1)
         except Exception as exc:
             logger.error("Gemini multimodal error on attempt %s: %s", attempt + 1, exc)
@@ -469,13 +670,15 @@ def _send_gemini_request(model, prompt: str, max_retries: int = 3) -> str:
                 prompt,
                 generation_config=genai.types.GenerationConfig(
                     temperature=0,  # Consistent extraction
-                    max_output_tokens=4096,
+                    max_output_tokens=8192,
+                    response_mime_type="application/json",
                 )
             )
             
-            if response and response.text:
+            response_text = _get_response_text(response)
+            if response_text:
                 logger.info("Successfully received response from Gemini")
-                return response.text
+                return response_text
             else:
                 logger.warning(f"Empty response from Gemini on attempt {attempt + 1}")
                 
@@ -492,6 +695,39 @@ def _send_gemini_request(model, prompt: str, max_retries: int = 3) -> str:
     
     raise Exception("Gemini API failed after all retry attempts")
 
+def _get_response_text(response) -> str:
+    """Extract text from a Gemini response, including blocked/partial candidates."""
+    if not response:
+        return ""
+
+    try:
+        text = response.text
+        if text and text.strip():
+            return text.strip()
+    except (ValueError, AttributeError):
+        pass
+
+    candidates = getattr(response, "candidates", None) or []
+    for candidate in candidates:
+        content = getattr(candidate, "content", None)
+        if not content:
+            continue
+        parts = getattr(content, "parts", None) or []
+        chunks = []
+        for part in parts:
+            part_text = getattr(part, "text", None)
+            if part_text:
+                chunks.append(part_text)
+        if chunks:
+            return "".join(chunks).strip()
+
+    prompt_feedback = getattr(response, "prompt_feedback", None)
+    if prompt_feedback:
+        logger.warning("Gemini prompt feedback: %s", prompt_feedback)
+
+    return ""
+
+
 def _parse_json_response(response_text: str) -> dict:
     """
     Parse JSON response from Gemini with error handling
@@ -502,19 +738,38 @@ def _parse_json_response(response_text: str) -> dict:
     Returns:
         Parsed dictionary
     """
+    if not response_text or not response_text.strip():
+        logger.warning("Empty Gemini response text")
+        return {}
+
     try:
-        # Try to find JSON in the response
-        start_idx = response_text.find('{')
-        end_idx = response_text.rfind('}')
-        
-        if start_idx != -1 and end_idx != -1:
-            json_str = response_text[start_idx:end_idx + 1]
-            parsed_data = json.loads(json_str)
+        text = response_text.strip()
+
+        # Strip markdown code fences if present
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+            text = re.sub(r"\s*```$", "", text)
+
+        # Try direct parse first
+        try:
+            parsed_data = json.loads(text)
             logger.info("Successfully parsed JSON response from Gemini")
-            return parsed_data
-        else:
-            logger.warning("No JSON found in Gemini response")
-            return {}
+            return parsed_data if isinstance(parsed_data, dict) else {}
+        except json.JSONDecodeError:
+            pass
+
+        # Fallback: extract outermost JSON object
+        start_idx = text.find("{")
+        end_idx = text.rfind("}")
+        
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            json_str = text[start_idx:end_idx + 1]
+            parsed_data = json.loads(json_str)
+            logger.info("Successfully parsed embedded JSON response from Gemini")
+            return parsed_data if isinstance(parsed_data, dict) else {}
+
+        logger.warning("No JSON found in Gemini response")
+        return {}
             
     except json.JSONDecodeError as e:
         logger.error(f"JSON parsing error: {str(e)}")

@@ -91,12 +91,12 @@ async def validate_documents(
         noa_text, noa_text_method = extract_document_text(noa_path, noa_content)
         logger.info("T1 text method: %s, NOA text method: %s", t1_text_method, noa_text_method)
         
-        # Extract structured data (text → Gemini Vision fallback if sparse)
+        # Extract structured data (regex → vision/text → vision fallback)
         t1_data = extract_structured_data_t1_smart(
-            t1_text, t1_path, t1_content, model
+            t1_text, t1_path, t1_content, model, text_method=t1_text_method
         )
         noa_data = extract_structured_data_noa_smart(
-            noa_text, noa_path, noa_content, model
+            noa_text, noa_path, noa_content, model, text_method=noa_text_method
         )
         
         # Perform cross-document validation

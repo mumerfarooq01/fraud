@@ -10,7 +10,7 @@ import time
 # sys.path.insert(0, os.path.abspath(settings.FRAUD_DETECTION_CODE_PATH))
 
 # Import routes AFTER adding fraud-detection-poc to sys.path
-from app.api.v1.routes import forensics, comparison, database
+from app.api.v1.routes import forensics, comparison, database, documents
 
 # Create FastAPI application
 app = FastAPI(
@@ -60,6 +60,12 @@ app.include_router(
     tags=["database"]
 )
 
+app.include_router(
+    documents.router,
+    prefix=settings.API_V1_STR,
+    tags=["documents"]
+)
+
 # Root endpoint
 @app.get("/", tags=["system"])
 async def root():
@@ -87,6 +93,7 @@ async def health_check():
         "features": {
             "forensics": True,
             "comparison": True,
+            "document_extraction": True,
             "database": True
         },
         "config": {
